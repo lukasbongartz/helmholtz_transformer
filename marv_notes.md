@@ -1,6 +1,6 @@
 # Notes
 
-* [TODO] theoretische seite: simuliere FPE auf sphäre.
+* [TODO] Here be dragons.
 * [TODO]
 * [TODO]
 * [TODO]
