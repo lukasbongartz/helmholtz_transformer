@@ -5,7 +5,6 @@ Run the experiments that generate entropy/free-energy plots using DistilGPT2.
 ### Setup
 
 ```bash
-cd "/Users/lukasbongartz/Desktop/Transformer Paper/code/helmholtz_transformer"
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
