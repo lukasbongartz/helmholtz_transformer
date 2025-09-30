@@ -39,7 +39,8 @@ def get_mlp_mats(block: nn.Module) -> Tuple[Tensor, Tensor, Callable[[Tensor], T
             raise ValueError("Could not locate MLP Linear layers (c_fc, c_proj)")
     W_in = c_fc.weight.detach()      # [F, D]
     W_out = c_proj.weight.detach()   # [D, F]
-    sigma = F.gelu  # GPT-2 uses GELU
+    # Use exact GELU to match gelu_prime (erf-based)
+    sigma = lambda z: F.gelu(z, approximate='none')
     return W_in, W_out, sigma
 
 def get_attn_qkv_mats(block: nn.Module, n_heads: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, int]:
@@ -65,6 +66,11 @@ def get_attn_qkv_mats(block: nn.Module, n_heads: Optional[int] = None) -> Tuple[
         WQ = W[:, :D]; WK = W[:, D:2*D]; WV = W[:, 2*D:]
     if n_heads is None:
         n_heads = getattr(attn, "num_heads", None) or getattr(attn, "n_head", None) or 1
+    # Head/shape guards
+    Dq, Dk, Dv = WQ.shape[0], WK.shape[0], WV.shape[0]
+    assert Dq == Dk == Dv, f"Q/K/V out dims mismatch: {Dq}, {Dk}, {Dv}"
+    assert WQ.shape[1] == WK.shape[1] == WV.shape[1] == Dq, "Q/K/V in dims must equal D"
+    assert int(n_heads) >= 1 and Dq % int(n_heads) == 0, f"D={Dq} must be divisible by n_heads={n_heads}"
     return WQ, WK, WV, int(n_heads)
 
 # -------------------------
@@ -134,27 +140,55 @@ def _gauss_legendre_0_1(n: int, device=None, dtype=None) -> Tuple[Tensor, Tensor
 # Diffusion ν_t (scalar) from attention
 # -------------------------
 
+def sinkhorn_ds(A: Tensor, iters: int = 50, eps: float = 1e-6) -> Tensor:
+    """
+    Make A (..., N, N) doubly-stochastic via Sinkhorn iterations.
+    A must be non-negative. Returns K with rows and columns ≈ 1.
+    """
+    K = A.clamp_min(1e-30)
+    for _ in range(iters):
+        K = K / (K.sum(dim=-1, keepdim=True).clamp_min(1e-30))
+        K = K / (K.sum(dim=-2, keepdim=True).clamp_min(1e-30))
+        if (K.sum(-1) - 1).abs().max() < eps and (K.sum(-2) - 1).abs().max() < eps:
+            break
+    return K
+
 def nu(block: nn.Module, X: Tensor, attn_mask: Optional[Tensor] = None) -> float:
+    """
+    Estimate scalar ν from multi-head attention with doubly-stochastic kernels (Sinkhorn).
+    Implements per-head Q/K/V with scale 1/sqrt(d_k), then averages head-wise trace estimator.
+    """
     B, N, D = X.shape
     device, dtype = X.device, X.dtype
     WQ, WK, WV, n_heads = get_attn_qkv_mats(block)
     WQ = WQ.to(device=device, dtype=dtype)
     WK = WK.to(device=device, dtype=dtype)
     WV = WV.to(device=device, dtype=dtype)
-    Q = X @ WQ      # [B,N,D]
-    K = X @ WK      # [B,N,D]
-    scale = 1.0 / math.sqrt(D / max(n_heads, 1))
-    logits = torch.einsum("bid,bjd->bij", Q, K) * scale
+    d_k = D // max(n_heads, 1)
+
+    # Per-head projections
+    Q = (X @ WQ).view(B, N, n_heads, d_k).transpose(1, 2)  # [B, H, N, d_k]
+    K = (X @ WK).view(B, N, n_heads, d_k).transpose(1, 2)  # [B, H, N, d_k]
+    V = (X @ WV).view(B, N, n_heads, d_k).transpose(1, 2)  # [B, H, N, d_k]
+    scale = 1.0 / math.sqrt(max(d_k, 1))
+    logits = torch.einsum("bhnc,bhmc->bhnm", Q, K) * scale  # [B, H, N, N]
     if attn_mask is not None:
-        logits = logits + attn_mask
-    P = torch.softmax(logits, dim=-1)
-    m = torch.einsum("bij,bjd->bid", P, X)
-    Xm = X.unsqueeze(1) - m.unsqueeze(2)              # [B,N,N,D]
-    WX = Xm @ WV.t()                                   # [B,N,N,D]
-    sq = (WX * WX).sum(dim=-1)                         # [B,N,N]
-    tr_term = (P * sq).sum(dim=-1)                     # [B,N]
-    tr_Sigma = 0.5 * tr_term.mean().item()
-    nu_scalar = tr_Sigma / D
+        # attn_mask: [B, N, N] -> [B, 1, N, N]
+        logits = logits + attn_mask.unsqueeze(1)
+
+    # Doubly-stochastic attention via Sinkhorn
+    A = torch.exp(logits)  # non-negative
+    P = sinkhorn_ds(A)     # [B, H, N, N]
+
+    # Head-wise trace estimator (use full D via WV)
+    Xh = X.unsqueeze(1).expand(-1, n_heads, -1, -1)          # [B, H, N, D]
+    m = torch.einsum("bhnm,bhmd->bhnd", P, Xh)              # [B, H, N, D]
+    Xm = Xh.unsqueeze(2) - m.unsqueeze(2)                    # [B, H, N, N, D]
+    WX = torch.einsum("...d,df->...f", Xm, WV.t())          # [B, H, N, N, D]
+    sq = (WX * WX).sum(dim=-1)                               # [B, H, N, N]
+    tr_term = (P * sq).sum(dim=-1)                           # [B, H, N]
+    tr_Sigma = 0.5 * tr_term.mean(dim=(-1, -2))              # [B, H]
+    nu_scalar = (tr_Sigma / D).mean().item()                 # average over heads and batch
     return float(nu_scalar)
 
 # -------------------------
@@ -170,6 +204,12 @@ def fpe(X0: Tensor,
         return_all: bool = True,
         noise_device: Optional[torch.device] = None,
         seed: Optional[int] = None) -> Tensor:
+    """
+    Stratonovich SDE integrator on the sphere S^{D-1} with projection to the tangent
+    and renormalization after each micro-step. This convention avoids adding the
+    Itô curvature drift term. If using Itô, one may add a curvature drift
+    -(D-1) * ν_t * X dt right after the noise step (before renormalization).
+    """
     assert micro_steps_per_block in (1, 2)
     L = len(gradU_ts); assert len(nu_ts) == L
     X = normalize_sphere(X0.clone())
@@ -183,6 +223,8 @@ def fpe(X0: Tensor,
                 eta = torch.randn_like(X, device=noise_device)
                 eta = tangent_project(X, eta)
                 X = X + math.sqrt(2.0 * max(nu_t, 0.0) * dt) * eta
+                    # Optional Itô curvature drift (disabled by default):
+                    # X = X - dt * ((X.shape[-1] - 1) * nu_t) * X
                 X = normalize_sphere(X)
             if return_all: out.append(X.clone())
         drift = gradU_ts[t](X)
@@ -253,7 +295,8 @@ def collect_after_ln_states(model: nn.Module,
         attn_out = b.attn(x1, layer_past=None, attention_mask=None, head_mask=None,
                           use_cache=False, output_attentions=False)
         a = attn_out[0] if isinstance(attn_out, (tuple, list)) else attn_out
-        h = h + b.attn.c_proj(a)
+        #h = h + b.attn.c_proj(a)
+        h = h + a
         x2 = b.ln_2(h); ln2_list.append(normalize_sphere(x2.detach()))
         mlp_out = b.mlp(x2)
         h = h + mlp_out
@@ -358,7 +401,7 @@ def theoretical_path_closed_form(model: nn.Module,
         H_val = gaussian_entropy_from_cov(Sigma, m)
         Htan = hessian_U_tangent(blocks[t], mu)
         E_val = float(U_ts[t](mu.unsqueeze(0)).mean()) + 0.5 * float(torch.trace(Htan @ Sigma))
-        F_val = nu_ts[t] * H_val + E_val
+        F_val = E_val - nu_ts[t] * H_val
         Hs.append(H_val); Es.append(E_val); Fs.append(F_val)
 
         # --- micro-step M: OU with constant H_t over dt ---
@@ -373,7 +416,7 @@ def theoretical_path_closed_form(model: nn.Module,
 
         H_val = gaussian_entropy_from_cov(Sigma, m)
         E_val = float(U_ts[t](mu.unsqueeze(0)).mean()) + 0.5 * float(torch.trace(Htan @ Sigma))
-        F_val = nu_ts[t] * H_val + E_val
+        F_val = E_val - nu_ts[t] * H_val
         Hs.append(H_val); Es.append(E_val); Fs.append(F_val)
 
     return {"entropy": Hs, "energy": Es, "free": Fs}
@@ -421,7 +464,9 @@ def tangent_mean_and_cov(X: Tensor) -> Tuple[Tensor, Tensor]:
     mu = X.mean(dim=(0,1)) if X.dim() == 3 else X.mean(dim=0)
     mu = normalize_sphere(mu)
     Xm = X - mu
-    Cov = torch.einsum("...i,...j->ij", Xm, Xm) / (Xm.numel() / Xm.shape[-1])  # unbiased-ish
+    denom = (Xm.numel() / Xm.shape[-1]) - 1
+    denom = max(int(denom), 1)
+    Cov = torch.einsum("...i,...j->ij", Xm, Xm) / denom
     Q, P = tangent_basis(mu)
     Sigma = P @ Cov @ P
     Sigma = 0.5 * (Sigma + Sigma.t())
@@ -463,7 +508,7 @@ def theoretical_path_OU(model: nn.Module,
     """
     OU predictor on S^{D-1} with per-layer Hessians at the mean.
     Steps: A (diffusion): Σ <- Σ + 2ν_t dt I_tan;  M (drift): μ <- μ - dt ∇U(μ),  Σ <- Σ - (HΣ+ΣH)dt.
-    Entropy: Gaussian H(Σ); Energy: U(μ) + 0.5 tr(H Σ). Free energy: ν_t H + Energy.
+    Entropy: Gaussian H(Σ); Energy: U(μ) + 0.5 tr(H Σ). Free energy: E - ν_t H.
     Returns arrays over 2L micro-steps.
     """
     blocks = _get_blocks(model)
@@ -482,7 +527,8 @@ def theoretical_path_OU(model: nn.Module,
         Sigma = Sigma + (2.0 * nu_ts[t] * dt) * P
         H_gauss = gaussian_entropy_from_cov(Sigma, m)
         E = float(U_ts[t](mu.unsqueeze(0)).mean()) + 0.5 * float(torch.trace(hessian_U_tangent(blocks[t], mu) @ Sigma))
-        F = nu_ts[t] * H_gauss + E
+        #F = nu_ts[t] * H_gauss + E
+        F = E - nu_ts[t] * H_gauss
         H_series.append(H_gauss); E_series.append(E); F_series.append(F)
 
         # --- micro-step M (MLP drift) ---
@@ -497,7 +543,8 @@ def theoretical_path_OU(model: nn.Module,
 
         H_gauss = gaussian_entropy_from_cov(Sigma, m)
         E = float(U_ts[t](mu.unsqueeze(0)).mean()) + 0.5 * float(torch.trace(Htan @ Sigma))
-        F = nu_ts[t] * H_gauss + E
+        #F = nu_ts[t] * H_gauss + E
+        F = E - nu_ts[t] * H_gauss
         H_series.append(H_gauss); E_series.append(E); F_series.append(F)
 
     return {"entropy": H_series, "energy": E_series, "free": F_series}
@@ -519,7 +566,8 @@ def empirical_from_forward(ln1_list: List[Tensor],
         for X in (ln1_list[t], ln2_list[t]):
             H = float(empirical_entropy_KL(X))
             E = float(empirical_energy_U(X, U_ts[t]))
-            F = nu_ts[t] * H + E
+            #F = nu_ts[t] * H + E
+            F = E - nu_ts[t] * H
             Hs.append(H); Es.append(E); Fs.append(F)
     return {"entropy": Hs, "energy": Es, "free": Fs}
 

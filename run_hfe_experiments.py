@@ -101,7 +101,7 @@ def main():
         Xk = X_path[k]
         Hk = float(hfe.empirical_entropy_KL(Xk))
         Ek = float(hfe.empirical_energy_U(Xk, U_ts[t]))
-        Fk = nu_ts[t] * Hk + Ek
+        Fk = Ek - nu_ts[t] * Hk
         sim_H.append(Hk); sim_F.append(Fk)
 
     # ====== 4) EMPIRICAL (forward-only, at LN1/LN2) ======
