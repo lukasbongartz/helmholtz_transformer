@@ -140,7 +140,7 @@ def _gauss_legendre_0_1(n: int, device=None, dtype=None) -> Tuple[Tensor, Tensor
 # Diffusion ν_t (scalar) from attention
 # -------------------------
 
-def sinkhorn_ds(A: Tensor, iters: int = 50, eps: float = 1e-6) -> Tensor:
+def sinkhorn_ds(A: Tensor, iters: int = 200, eps: float = 1e-8) -> Tensor:
     """
     Make A (..., N, N) doubly-stochastic via Sinkhorn iterations.
     A must be non-negative. Returns K with rows and columns ≈ 1.
